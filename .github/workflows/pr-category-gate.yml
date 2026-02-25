@@ -1,0 +1,141 @@
+name: PR Category Gate
+
+on:
+  workflow_call:
+    inputs:
+      docs_only_globs:
+        description: 'Comma-separated list of minimatch globs. If ALL changed files match these, gate passes early.'
+        required: false
+        type: string
+        default: '**/*.md,documentation/**,docs/**'
+      require_categories:
+        description: 'Comma-separated list of required categories: ai,static,security'
+        required: false
+        type: string
+        default: 'ai,static,security'
+      ai_check_name_patterns:
+        description: 'Comma-separated regex patterns. If any successful check-run name matches, AI category is satisfied.'
+        required: false
+        type: string
+        default: '(?i)gemini,(?i)coderabbit,(?i)ai review'
+      static_check_name_patterns:
+        description: 'Comma-separated regex patterns. If any successful check-run name matches, Static category is satisfied.'
+        required: false
+        type: string
+        default: '(?i)sonarcloud.*quality gate,(?i)codeql,(?i)semgrep'
+      security_check_name_patterns:
+        description: 'Comma-separated regex patterns. If any successful check-run name matches, Security category is satisfied.'
+        required: false
+        type: string
+        default: '(?i)snyk,(?i)osv,(?i)trivy,(?i)grype'
+    outputs:
+      satisfied:
+        description: 'true if the gate passed'
+        value: ${{ jobs.gate.outputs.satisfied }}
+      details_json:
+        description: 'JSON details of category satisfaction'
+        value: ${{ jobs.gate.outputs.details_json }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  gate:
+    name: category-gate
+    runs-on: ubuntu-latest
+    outputs:
+      satisfied: ${{ steps.eval.outputs.satisfied }}
+      details_json: ${{ steps.eval.outputs.details_json }}
+    steps:
+      - name: Evaluate gate
+        id: eval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+
+            function csv(s) {
+              return (s || '').split(',').map(x => x.trim()).filter(Boolean);
+            }
+
+            function compileRegexes(patternCsv) {
+              const parts = csv(patternCsv);
+              return parts.map(p => new RegExp(p));
+            }
+
+            function anyMatch(name, regexes) {
+              return regexes.some(r => r.test(name));
+            }
+
+            // Ensure we're running on a PR-related event in the caller
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('This reusable workflow must be called from a pull_request context.');
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = pr.number;
+
+            const docsOnlyGlobs = csv(core.getInput('docs_only_globs'));
+            const requireCategories = new Set(csv(core.getInput('require_categories')).map(s => s.toLowerCase()));
+
+            const aiRegexes = compileRegexes(core.getInput('ai_check_name_patterns'));
+            const staticRegexes = compileRegexes(core.getInput('static_check_name_patterns'));
+            const securityRegexes = compileRegexes(core.getInput('security_check_name_patterns'));
+
+            // Fetch changed files
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number, per_page: 100 });
+            const filenames = files.map(f => f.filename);
+
+            // docs-only short-circuit
+            const { minimatch } = require('minimatch');
+            const isDocsOnly = filenames.length > 0 && filenames.every(fn => docsOnlyGlobs.some(glob => minimatch(fn, glob)));
+
+            // Fetch check-runs for latest PR head SHA
+            const head_sha = pr.head.sha;
+            const checkRunsResp = await github.rest.checks.listForRef({ owner, repo, ref: head_sha, per_page: 100 });
+            const checkRuns = checkRunsResp.data.check_runs || [];
+
+            // Normalize successful checks
+            const successful = checkRuns.filter(cr => cr.conclusion === 'success' || cr.conclusion === 'neutral');
+            const successNames = successful.map(cr => cr.name);
+
+            // Category satisfaction based on check runs (deterministic)
+            const aiSatisfied = successNames.some(n => anyMatch(n, aiRegexes));
+            const staticSatisfied = successNames.some(n => anyMatch(n, staticRegexes));
+            const securitySatisfied = successNames.some(n => anyMatch(n, securityRegexes));
+
+            // Build details
+            const details = {
+              repo: `${owner}/${repo}`,
+              pr: pull_number,
+              head_sha,
+              docs_only: isDocsOnly,
+              required_categories: Array.from(requireCategories),
+              categories: {
+                ai: { satisfied: aiSatisfied, matched_success_checks: successNames.filter(n => anyMatch(n, aiRegexes)) },
+                static: { satisfied: staticSatisfied, matched_success_checks: successNames.filter(n => anyMatch(n, staticRegexes)) },
+                security: { satisfied: securitySatisfied, matched_success_checks: successNames.filter(n => anyMatch(n, securityRegexes)) },
+              },
+              changed_files_count: filenames.length,
+              changed_files_sample: filenames.slice(0, 25),
+              successful_checks_sample: successNames.slice(0, 50),
+            };
+
+            let satisfied = true;
+            if (!isDocsOnly) {
+              if (requireCategories.has('ai') && !aiSatisfied) satisfied = false;
+              if (requireCategories.has('static') && !staticSatisfied) satisfied = false;
+              if (requireCategories.has('security') && !securitySatisfied) satisfied = false;
+            }
+
+            core.setOutput('satisfied', String(satisfied));
+            core.setOutput('details_json', JSON.stringify(details));
+
+            if (!satisfied) {
+              core.setFailed(`Category gate failed. Details: ${JSON.stringify(details.categories)}`);
+            }
